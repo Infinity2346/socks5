@@ -1,40 +1,64 @@
 name: Проверка SOCKS5 прокси
 
 on:
-  schedule:
-    # Запуск каждые 5 минут. 
-    # Если лимит минут исчерпается, поменяйте на '*/30 * * * *' (каждые 30 мин)
-    - cron: '*/5 * * * *'
-  workflow_dispatch: # Позволяет запускать Action вручную из вкладки Actions
+  push:
+    branches:
+      - main
+    paths:
+      - 'proxies.txt' # Экшен сработает ТОЛЬКО если изменился этот файл
+  workflow_dispatch: # Оставляем ручной запуск на всякий случай
 
 jobs:
   check-proxies:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # Необходимо для пуша изменений обратно в репозиторий
+      contents: write
 
     steps:
       - name: Клонирование репозитория
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 2 # Берем историю чуть глубже, чтобы git мог сравнить коммиты
+
+      - name: Проверка — были ли добавлены новые прокси
+        id: check_changes
+        run: |
+          # Если запуск ручной, то всегда продолжаем
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "skip=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Сравниваем текущий коммит с предыдущим. Смотрим, добавились ли строки (+)
+          # Если строки только удалялись (чекер отработал ранее), то пропускаем.
+          if git diff HEAD^ HEAD -- proxies.txt | grep -q '^+[^+]'; then
+            echo "Обнаружены новые прокси, запускаем проверку."
+            echo "skip=false" >> $GITHUB_OUTPUT
+          else
+            echo "Файл изменился, но новые прокси не добавлялись (возможно, это была очистка)."
+            echo "skip=true" >> $GITHUB_OUTPUT
+          fi
 
       - name: Установка Python
+        if: steps.check_changes.outputs.skip != 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
       - name: Установка зависимостей
+        if: steps.check_changes.outputs.skip != 'true'
         run: |
           python -m pip install --upgrade pip
           pip install requests pysocks
 
       - name: Запуск скрипта проверки
-        run: python checker.py
+        if: steps.check_changes.outputs.skip != 'true'
+        run: python -u checker.py # Добавил -u для логов в реальном времени!
 
       - name: Коммит и пуш изменений
+        if: steps.check_changes.outputs.skip != 'true'
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add proxies.txt
-          
-          # Проверяем, есть ли изменения. Если прокси не удалились, коммитить нечего.
           git diff --quiet && git diff --staged --quiet || (git commit -m "Авто-очистка нерабочих SOCKS5" && git push)
