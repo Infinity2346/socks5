@@ -4,17 +4,23 @@ import socks
 
 # Настройки
 PROXY_FILE = 'proxies.txt'
-# Будем стучаться на стандартный веб-порт Google CDN
 TEST_HOST = 'ajax.googleapis.com'
 TEST_PORT = 443
-TIMEOUT = 4  # Таймаут ожидания ответа от прокси в секундах
+TIMEOUT = 4  # Таймаут в секундах
 
 def check_proxy_raw(proxy_str):
     proxy_str = proxy_str.strip()
     if not proxy_str:
         return None
     
-    # Парсим строку прокси (формат IP:PORT или USER:PASS@IP:PORT)
+    # Сохраняем исходный вид для записи обратно в файл, если прокси живой
+    original_proxy = proxy_str 
+
+    # Очищаем от протоколов, если они случайно затесались в начале строки
+    if "://" in proxy_str:
+        proxy_str = proxy_str.split("://")[-1]
+
+    # Парсим строку прокси (поддержка IP:PORT и USER:PASS@IP:PORT)
     try:
         if '@' in proxy_str:
             auth, ip_port = proxy_str.split('@')
@@ -26,10 +32,10 @@ def check_proxy_raw(proxy_str):
         
         port = int(port)
     except Exception:
-        print(f"[-] {proxy_str} -> Ошибка формата строки")
+        print(f"[-] {original_proxy} -> Ошибка формата строки")
         return None
 
-    # Создаем чистый SOCKS5 сокет
+    # Создаем SOCKS5 сокет
     s = socks.socksocket()
     s.set_proxy(
         socks.SOCKS5, 
@@ -37,21 +43,19 @@ def check_proxy_raw(proxy_str):
         port=port, 
         username=username, 
         password=password,
-        rdns=True  # Удаленный резолв DNS (аналог socks5h)
+        rdns=True  # Резолвим DNS на стороне прокси
     )
     s.settimeout(TIMEOUT)
     
     start_time = time.time()
     try:
-        # Пытаемся установить TCP-соединение с Google через прокси
         s.connect((TEST_HOST, TEST_PORT))
         elapsed = (time.time() - start_time) * 1000
-        print(f"[+] {proxy_str} -> ЖИВОЙ (Ping: {int(elapsed)}ms)")
+        print(f"[+] {original_proxy} -> ЖИВОЙ ({int(elapsed)}ms)")
         s.close()
-        return proxy_str
+        return original_proxy  # Возвращаем исходную строку, чтобы не портить ваш формат файла
     except Exception as e:
-        # Выводим причину, почему прокси отвалился (Connection refused, Timeout и т.д.)
-        print(f"[-] {proxy_str} -> МЕРТВ ({type(e).__name__})")
+        print(f"[-] {original_proxy} -> МЕРТВ ({type(e).__name__})")
         return None
 
 def main():
@@ -70,16 +74,15 @@ def main():
     working_proxies = []
     
     for idx, proxy in enumerate(proxies, 1):
-        # Проверяем прокси
         res = check_proxy_raw(proxy)
         if res:
             working_proxies.append(res)
             
-        # Небольшая пауза между проверками, чтобы избежать сетевых затыков
+        # Пауза в полсекунды между проверками
         if idx < len(proxies):
             time.sleep(0.5)
 
-    # Перезаписываем файл
+    # Перезаписываем файл только живыми прокси
     with open(PROXY_FILE, 'w') as f:
         for proxy in working_proxies:
             f.write(f"{proxy}\n")
