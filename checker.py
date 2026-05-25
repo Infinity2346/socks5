@@ -1,93 +1,107 @@
+import os
 import time
-import socket
-import socks
+import requests
 
-# Настройки
-PROXY_FILE = 'proxies.txt'
-TEST_HOST = 'ajax.googleapis.com'
-TEST_PORT = 443
-TIMEOUT = 4  # Таймаут в секундах
+# Конфигурация
+TIMEOUT = 4  # Максимальное время ожидания ответа от прокси
+CHECK_URL = 'https://api.ipify.org?format=json'  # Легкий URL для проверки
 
-def check_proxy_raw(proxy_str):
-    proxy_str = proxy_str.strip()
-    if not proxy_str:
+def check_proxy(proxy_str):
+    """
+    Проверяет один прокси. 
+    Возвращает кортеж: (proxy_str, is_alive, ping_ms, error_reason)
+    """
+    cleaned_proxy = proxy_str.strip()
+    if not cleaned_proxy:
         return None
-    
-    # Сохраняем исходный вид для записи обратно в файл, если прокси живой
-    original_proxy = proxy_str 
-
-    # Очищаем от протоколов, если они случайно затесались в начале строки
-    if "://" in proxy_str:
-        proxy_str = proxy_str.split("://")[-1]
-
-    # Парсим строку прокси (поддержка IP:PORT и USER:PASS@IP:PORT)
-    try:
-        if '@' in proxy_str:
-            auth, ip_port = proxy_str.split('@')
-            username, password = auth.split(':')
-            ip, port = ip_port.split(':')
-        else:
-            username, password = None, None
-            ip, port = proxy_str.split(':')
         
-        port = int(port)
-    except Exception:
-        print(f"[-] {original_proxy} -> Ошибка формата строки")
-        return None
-
-    # Создаем SOCKS5 сокет
-    s = socks.socksocket()
-    s.set_proxy(
-        socks.SOCKS5, 
-        addr=ip, 
-        port=port, 
-        username=username, 
-        password=password,
-        rdns=True  # Резолвим DNS на стороне прокси
-    )
-    s.settimeout(TIMEOUT)
+    # Форматируем строку под requests (добавляем socks5:// если нет)
+    formatted_proxy = cleaned_proxy
+    if not formatted_proxy.startswith('socks5://'):
+        formatted_proxy = f'socks5://{formatted_proxy}'
+        
+    proxies = {
+        'http': formatted_proxy,
+        'https': formatted_proxy
+    }
     
     start_time = time.time()
     try:
-        s.connect((TEST_HOST, TEST_PORT))
-        elapsed = (time.time() - start_time) * 1000
-        print(f"[+] {original_proxy} -> ЖИВОЙ ({int(elapsed)}ms)")
-        s.close()
-        return original_proxy  # Возвращаем исходную строку, чтобы не портить ваш формат файла
+        # Делаем запрос через прокси
+        response = requests.get(CHECK_URL, proxies=proxies, timeout=TIMEOUT)
+        if response.status_code == 200:
+            ping = int((time.time() - start_time) * 1000)
+            return (cleaned_proxy, True, ping, None)
+        else:
+            return (cleaned_proxy, False, 0, f"Status{response.status_code}")
+    except requests.exceptions.ProxyError as e:
+        return (cleaned_proxy, False, 0, "ProxyError")
+    except requests.exceptions.ConnectTimeout:
+        return (cleaned_proxy, False, 0, "Timeout")
     except Exception as e:
-        print(f"[-] {original_proxy} -> МЕРТВ ({type(e).__name__})")
-        return None
+        return (cleaned_proxy, False, 0, type(e).__name__)
 
 def main():
-    try:
-        with open(PROXY_FILE, 'r') as f:
-            proxies = [line.strip() for line in f if line.strip()]
-    except FileNotFoundError:
-        print(f"Файл {PROXY_FILE} не найден.")
-        return
-
-    if not proxies:
-        print("Список прокси пуст.")
-        return
-
-    print(f"Начало поочередной проверки {len(proxies)} прокси...")
-    working_proxies = []
+    file_path = 'proxies.txt'
     
-    for idx, proxy in enumerate(proxies, 1):
-        res = check_proxy_raw(proxy)
-        if res:
-            working_proxies.append(res)
-            
-        # Пауза в полсекунды между проверками
-        if idx < len(proxies):
-            time.sleep(0.5)
+    if not os.path.exists(file_path):
+        print(f"[-] Файл {file_path} не найден.")
+        return
 
-    # Перезаписываем файл только живыми прокси
-    with open(PROXY_FILE, 'w') as f:
-        for proxy in working_proxies:
-            f.write(f"{proxy}\n")
+    with open(file_path, 'r', encoding='utf-8') as f:
+        proxies_list = [line.strip() for line in f if line.strip()]
+
+    if not proxies_list:
+        print("[-] Список прокси пуст.")
+        return
+
+    print(f"Начало поочередной проверки {len(proxies_list)} прокси...")
+    
+    alive_proxies = [] # Тут будем копить кортежи (proxy, ping)
+    
+    for current_proxy in proxies_list:
+        result = check_proxy(current_proxy)
+        if not result:
+            continue
             
-    print(f"\nПроверка завершена. Сохранено живых: {len(working_proxies)} из {len(proxies)}")
+        proxy_str, is_alive, ping, error_reason = result
+        
+        if is_alive:
+            print(f"[+] {proxy_str} -> ЖИВОЙ ({ping}ms)")
+            alive_proxies.append((proxy_str, ping))
+        else:
+            print(f"[-] {proxy_str} -> МЕРТВ ({error_reason})")
+            
+        time.sleep(0.1) # Небольшая пауза, чтобы не спамить
+
+    print("\n--- Фильтрация результатов ---")
+    
+    if not alive_proxies:
+        print("[-] Ни один прокси не ответил. Файл будет очищен.")
+        final_list = []
+    else:
+        # Проверяем, есть ли хоть один прокси с пингом <= 500 ms
+        good_ping_proxies = [p for p in alive_proxies if p[1] <= 500]
+        
+        if good_ping_proxies:
+            # Если есть быстрые прокси, оставляем только их (остальные > 500 отсеиваем)
+            print(f"[!] Найдено прокси с пингом до 500мс. Применяем жесткий фильтр.")
+            final_list = [p[0] for p in good_ping_proxies]
+        else:
+            # Если у ВСЕХ пинг больше 500, то включаем мягкий режим: оставляем тех, у кого пинг <= 1000 ms
+            print(f"[!] У всех прокси пинг > 500мс. Переключаем порог на 1000мс.")
+            soft_ping_proxies = [p for p in alive_proxies if p[1] <= 1000]
+            final_list = [p[0] for p in soft_ping_proxies]
+            
+            if not final_list:
+                print("[-] Даже до 1000мс никого нет. Все живые прокси слишком медленные и будут удалены.")
+
+    # Перезаписываем файл proxies.txt отфильтрованными данными
+    with open(file_path, 'w', encoding='utf-8') as f:
+        for proxy in final_list:
+            f.write(f"{proxy}\n")
+
+    print(f"Проверка завершена. Сохранено в файл: {len(final_list)} из {len(proxies_list)}")
 
 if __name__ == '__main__':
     main()
